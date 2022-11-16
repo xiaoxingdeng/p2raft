@@ -1,15 +1,19 @@
 package raft
 
-import "github.com/cmu440/rpc"
-import "log"
-import "sync"
-import "testing"
-import "runtime"
-import crand "crypto/rand"
-import "encoding/base64"
-import "sync/atomic"
-import "time"
-import "fmt"
+import (
+	"log"
+	"runtime"
+	"sync"
+	"testing"
+
+	"github.com/cmu440/rpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
 
 //
 // Raft tests.
@@ -59,6 +63,61 @@ func TestReElection2A(t *testing.T) {
 	cfg.checkOneLeader()
 
 	fmt.Printf("======================= END =======================\n\n")
+}
+
+func TestReElectionHidden2A(t *testing.T) {
+	fmt.Printf("==================== 3 SERVERS ====================\n")
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Basic 1 leader\n")
+	leader1 := cfg.checkOneLeader()
+	fmt.Printf("Leader is %v\n\n", leader1)
+
+	fmt.Printf("Disconnecting leader\n\n")
+	cfg.disconnect(leader1)
+
+	fmt.Printf("Checking for a new leader\n")
+	leader2 := cfg.checkOneLeader()
+	fmt.Printf("Leader is %v\n\n", leader2)
+
+	fmt.Printf("Reconnecting old leader\n\n")
+	cfg.connect(leader1)
+
+	fmt.Printf("Waiting a bit\n\n")
+	time.Sleep(time.Duration(5) * time.Second)
+
+	fmt.Printf("Checking current leader\n\n")
+	leader3 := cfg.checkOneLeader()
+	fmt.Printf("Leader is %v\n", leader3)
+
+	fmt.Printf("Disconnecting leader+one moew peer\n\n")
+	cfg.disconnect(leader3)
+	peer := 1
+	if peer == leader3 {
+		peer = 2
+	}
+	cfg.disconnect(peer)
+
+	fmt.Printf("Waiting a bit\n\n")
+	time.Sleep(time.Duration(5) * time.Second)
+
+	fmt.Printf("Checking if there is no leader\n\n")
+	cfg.checkNoLeader()
+
+	fmt.Printf("Reconnecting disconnected peer\n\n")
+	cfg.connect(peer)
+
+	fmt.Printf("Waiting a bit\n\n")
+	time.Sleep(time.Duration(5) * time.Second)
+
+	fmt.Printf("Checking if there is a leader\n")
+	leader5 := cfg.checkOneLeader()
+	fmt.Printf("Leader is %v\n\n", leader5)
+
+	fmt.Printf("======================= END =======================\n\n")
+
 }
 
 func TestBasicAgree2B(t *testing.T) {
@@ -362,13 +421,11 @@ func (cfg *config) crash1(i int) {
 	}
 }
 
-//
 // start or re-start a Raft.
 // if one already exists, "kill" it first.
 // allocate new outgoing port file names
 // to isolate previous instance of
 // this server. since we cannot really kill it.
-//
 func (cfg *config) start1(i int) {
 	cfg.crash1(i)
 

@@ -85,6 +85,9 @@ type Raft struct {
 	role     int
 	votedFor int
 
+	receiveheartbeat bool
+	receivevote      bool
+
 	//chan
 	reuestStateChan chan bool
 	stateChan       chan *State
@@ -351,6 +354,9 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 		appendRequestFinished: make(chan bool),
 		appendResult:          make(chan *AppendRequest),
 		receivedYesVotes:      0,
+
+		receiveheartbeat: false,
+		receivevote:      false,
 	}
 	rf.peers = peers
 	rf.me = me
@@ -384,8 +390,28 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 
 func (rf *Raft) mainRoutine() {
 	for {
+		switch rf.role {
+		//Follower
+		case 0:
+			rf.FollowerAction()
+		//Leader
+		case 1:
+			rf.LeaderAction()
+		//Candidate
+		case 2:
+			rf.CandidateAction()
+		}
+	}
+}
+
+func (rf *Raft) FollowerAction() {
+	random := rand.Intn(150) + 150
+	timer := time.NewTimer(time.Duration(random) * time.Millisecond)
+	for {
+		if rf.role != 0 {
+			return
+		}
 		select {
-		//get the state of the rf
 		case <-rf.reuestStateChan:
 			var isLeader bool
 			if rf.role == 1 {
@@ -399,175 +425,210 @@ func (rf *Raft) mainRoutine() {
 				isleader: isLeader,
 			}
 			rf.stateChan <- st
-		default:
-			switch rf.role {
-			//Follower
-			case 0:
-				rf.FollowerAction()
-			//Leader
-			case 1:
-				rf.LeaderAction()
-			//Candidate
-			case 2:
-				rf.CandidateAction()
+		case <-timer.C:
+			//timeout for Follower,change to Candidate and start vote request
+			if rf.receiveheartbeat {
+				//next timer
+				random = rand.Intn(150) + 150
+				timer = time.NewTimer(time.Duration(random) * time.Millisecond)
+				rf.receiveheartbeat = false
+			} else {
+				rf.role = 2
+				rf.NewRequestVoteRound()
 			}
-		}
-	}
-}
-
-func (rf *Raft) FollowerAction() {
-	random := rand.Intn(150) + 150
-	timer := time.NewTimer(time.Duration(random) * time.Millisecond)
-	select {
-	case <-timer.C:
-		//timeout for Follower,change to Candidate and start vote request
-		rf.role = 2
-		rf.NewRequestVoteRound()
-	case newrequest := <-rf.askedToVote:
-		args := newrequest.args
-		reply := newrequest.reply
-		if rf.term < args.Term {
-			rf.term = args.Term
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-			reply.Term = args.Term
-		} else if rf.term == args.Term {
-			if rf.votedFor == -1 {
+		case newrequest := <-rf.askedToVote:
+			args := newrequest.args
+			reply := newrequest.reply
+			if rf.term < args.Term {
+				rf.term = args.Term
+				rf.votedFor = args.CandidateId
 				reply.VoteGranted = true
 				reply.Term = args.Term
-				rf.votedFor = args.CandidateId
+			} else if rf.term == args.Term {
+				if rf.votedFor == -1 {
+					reply.VoteGranted = true
+					reply.Term = args.Term
+					rf.votedFor = args.CandidateId
+				} else {
+					reply.VoteGranted = false
+					reply.Term = args.Term
+				}
 			} else {
 				reply.VoteGranted = false
-				reply.Term = args.Term
+				reply.Term = rf.term
 			}
-		} else {
-			reply.VoteGranted = false
-			reply.Term = rf.term
+			rf.requestFinished <- true
+		case appendrequest := <-rf.askedToAppend:
+			//receiving heartbeat set true
+			rf.receiveheartbeat = true
+
+			args := appendrequest.args
+			reply := appendrequest.reply
+			if rf.term < args.Term {
+				rf.term = args.Term
+				rf.votedFor = -1
+				reply.Success = true
+				reply.Term = args.Term
+			} else if rf.term == args.Term {
+				reply.Success = true
+				reply.Term = args.Term
+			} else {
+				reply.Success = false
+				reply.Term = rf.term
+			}
+			rf.appendRequestFinished <- true
+		case <-rf.appendResult:
+		case <-rf.voteResult:
 		}
-		rf.requestFinished <- true
-	case appendrequest := <-rf.askedToAppend:
-		args := appendrequest.args
-		reply := appendrequest.reply
-		if rf.term < args.Term {
-			rf.term = args.Term
-			rf.votedFor = -1
-			reply.Success = true
-			reply.Term = args.Term
-		} else if rf.term == args.Term {
-			reply.Success = true
-			reply.Term = args.Term
-		} else {
-			reply.Success = false
-			reply.Term = rf.term
-		}
-		rf.appendRequestFinished <- true
-	case <-rf.appendResult:
-	case <-rf.voteResult:
 	}
 }
 
 func (rf *Raft) LeaderAction() {
 	timer := time.NewTimer(time.Duration(100) * time.Millisecond)
-	select {
-	case <-timer.C:
-		//send heartbeat to all peers
-		rf.BroadcastAppend()
-	case newrequest := <-rf.askedToVote:
-		args := newrequest.args
-		reply := newrequest.reply
-		if rf.term < args.Term {
-			rf.role = 0
-			rf.term = args.Term
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-			reply.Term = args.Term
-		} else {
-			reply.VoteGranted = false
-			reply.Term = rf.term
+	for {
+		if rf.role != 1 {
+			return
 		}
-		rf.requestFinished <- true
-	case appendrequest := <-rf.askedToAppend:
-		args := appendrequest.args
-		reply := appendrequest.reply
-		if rf.term < args.Term {
-			//become a follower
-			rf.role = 0
-			rf.term = args.Term
-			rf.votedFor = -1
-			reply.Success = true
-			reply.Term = args.Term
-			////////////////////////////could it be two leader with the same term?
-		} else {
-			reply.Success = false
-			reply.Term = rf.term
+		select {
+		case <-rf.reuestStateChan:
+			var isLeader bool
+			if rf.role == 1 {
+				isLeader = true
+			} else {
+				isLeader = false
+			}
+			st := &State{
+				me:       rf.me,
+				term:     rf.term,
+				isleader: isLeader,
+			}
+			rf.stateChan <- st
+		case <-timer.C:
+			//send heartbeat to all peers
+			timer = time.NewTimer(time.Duration(100) * time.Millisecond)
+			rf.BroadcastAppend()
+		case newrequest := <-rf.askedToVote:
+			args := newrequest.args
+			reply := newrequest.reply
+			if rf.term < args.Term {
+				rf.role = 0
+				rf.term = args.Term
+				rf.votedFor = args.CandidateId
+				reply.VoteGranted = true
+				reply.Term = args.Term
+			} else {
+				reply.VoteGranted = false
+				reply.Term = rf.term
+			}
+			rf.requestFinished <- true
+		case appendrequest := <-rf.askedToAppend:
+			args := appendrequest.args
+			reply := appendrequest.reply
+			if rf.term < args.Term {
+				//become a follower
+				rf.role = 0
+				rf.term = args.Term
+				rf.votedFor = -1
+				reply.Success = true
+				reply.Term = args.Term
+				//
+			} else {
+				reply.Success = false
+				reply.Term = rf.term
+			}
+			rf.appendRequestFinished <- true
+		case appendresult := <-rf.appendResult:
+			reply := appendresult.reply
+			if reply.Term > rf.term {
+				rf.role = 0
+				rf.term = reply.Term
+				rf.votedFor = -1
+			}
+		case <-rf.voteResult:
 		}
-		rf.appendRequestFinished <- true
-	case appendresult := <-rf.appendResult:
-		reply := appendresult.reply
-		if !reply.Success {
-			rf.role = 0
-			rf.term = reply.Term
-			rf.votedFor = -1
-		}
-	case <-rf.voteResult:
 	}
 }
 
 func (rf *Raft) CandidateAction() {
-	random := rand.Intn(150) + 150
+	random := rand.Intn(300) + 300
 	timer := time.NewTimer(time.Duration(random) * time.Millisecond)
-	select {
-	case <-timer.C:
-		//timeout for Candidate,start a new vote request
-		rf.NewRequestVoteRound()
-	case newrequest := <-rf.askedToVote:
-		args := newrequest.args
-		reply := newrequest.reply
-		if rf.term < args.Term {
-			rf.role = 0
-			rf.term = args.Term
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-			reply.Term = args.Term
-		} else {
-			reply.VoteGranted = false
-			reply.Term = rf.term
+	for {
+		if rf.role != 2 {
+			return
 		}
-		rf.requestFinished <- true
-	case newreply := <-rf.voteResult:
-		reply := newreply.reply
-		if reply.Term == rf.term {
-			if reply.VoteGranted {
-				rf.receivedYesVotes += 1
-				if rf.receivedYesVotes*2 > len(rf.peers) {
-					rf.role = 1
-					rf.BroadcastAppend()
-				}
+		select {
+		case <-rf.reuestStateChan:
+			var isLeader bool
+			if rf.role == 1 {
+				isLeader = true
+			} else {
+				isLeader = false
 			}
-		} else if reply.Term < rf.term {
-			rf.role = 0
-			rf.votedFor = -1
-			rf.term = reply.Term
+			st := &State{
+				me:       rf.me,
+				term:     rf.term,
+				isleader: isLeader,
+			}
+			rf.stateChan <- st
+		case <-timer.C:
+			//timeout for Candidate,start a new vote request
+			random = rand.Intn(300) + 300
+			timer = time.NewTimer(time.Duration(random) * time.Millisecond)
+			if rf.receivevote {
+				//next timer
+				rf.receivevote = false
+			} else {
+				rf.NewRequestVoteRound()
+			}
+		case newrequest := <-rf.askedToVote:
+			args := newrequest.args
+			reply := newrequest.reply
+			if rf.term < args.Term {
+				rf.role = 0
+				rf.term = args.Term
+				rf.votedFor = args.CandidateId
+				reply.VoteGranted = true
+				reply.Term = args.Term
+			} else {
+				reply.VoteGranted = false
+				reply.Term = rf.term
+			}
+			rf.requestFinished <- true
+		case newreply := <-rf.voteResult:
+			rf.receivevote = true
+			//new reply from others
+			reply := newreply.reply
+			if reply.Term == rf.term {
+				if reply.VoteGranted {
+					rf.receivedYesVotes += 1
+					if rf.receivedYesVotes*2 > len(rf.peers) {
+						rf.role = 1
+						rf.BroadcastAppend()
+					}
+				}
+			} else if reply.Term < rf.term {
+				rf.role = 0
+				rf.votedFor = -1
+				rf.term = reply.Term
+			}
+		case appendrequest := <-rf.askedToAppend:
+			args := appendrequest.args
+			reply := appendrequest.reply
+			if rf.term <= args.Term {
+				//become a follower
+				rf.role = 0
+				rf.term = args.Term
+				rf.votedFor = -1
+				reply.Success = true
+				reply.Term = args.Term
+			} else {
+				reply.Success = false
+				reply.Term = rf.term
+			}
+			rf.appendRequestFinished <- true
+		case <-rf.appendResult:
 		}
-	case appendrequest := <-rf.askedToAppend:
-		args := appendrequest.args
-		reply := appendrequest.reply
-		if rf.term <= args.Term {
-			//become a follower
-			rf.role = 0
-			rf.term = args.Term
-			rf.votedFor = -1
-			reply.Success = true
-			reply.Term = args.Term
-		} else {
-			reply.Success = false
-			reply.Term = rf.term
-		}
-		rf.appendRequestFinished <- true
-	case <-rf.appendResult:
-
 	}
-
 }
 
 func (rf *Raft) NewRequestVoteRound() {
